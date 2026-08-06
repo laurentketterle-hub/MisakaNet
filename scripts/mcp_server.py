@@ -69,7 +69,7 @@ except ImportError:
     HAS_BM25 = False
 
 
-def _fallback_search(query: str, domain: str = None, top: int = 5) -> list | None:
+def _fallback_search(query: str, domain: str = None, top: int = 5, tags: str = None) -> list | None:
     """Lightweight keyword search from lessons.json — zero dependencies.
 
     Used when SAG-Lite and BM25 are both unavailable (e.g. Glama sandbox).
@@ -104,6 +104,11 @@ def _fallback_search(query: str, domain: str = None, top: int = 5) -> list | Non
             continue
         if domain and lesson.get("domain", "").lower() != domain.lower():
             continue
+        if tags:
+            tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
+            lesson_tags_str = " ".join(lesson.get("tags", [])).lower() if isinstance(lesson.get("tags"), list) else ""
+            if not any(t in lesson_tags_str for t in tag_list):
+                continue
 
         title = (lesson.get("title") or "").lower()
         summary = (lesson.get("summary") or "").lower()
@@ -141,12 +146,16 @@ def handle_search(args: dict) -> dict:
     query = args.get("query", "")
     domain = args.get("domain")
     top = args.get("top", 5)
+    tags = args.get("tags")
 
     if not query:
         return {"error": "query is required"}
 
     if HAS_SAG:
         results = sag_search(SAG_DB, query, domain=domain, top=top)
+        if tags:
+            tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
+            results = [r for r in results if any(t in " ".join(r.get("tags", [])).lower() for t in tag_list)]
         return {"results": results, "source": "sag-lite"}
     elif HAS_BM25:
         docs = _load_docs_cached(LESSONS, is_lesson=True)
@@ -163,7 +172,7 @@ def handle_search(args: dict) -> dict:
         return {"results": results, "source": "bm25"}
     else:
         # Fallback: lightweight keyword search from lessons.json
-        results = _fallback_search(query, domain=domain, top=top)
+        results = _fallback_search(query, domain=domain, top=top, tags=tags)
         if results is not None:
             return {"results": results, "source": "fallback"}
         return {"error": "No search engine available and no lessons.json found. Run: python3 scripts/build_sag_index.py"}
@@ -235,6 +244,71 @@ def handle_usage_status(args: dict) -> dict:
         return {"error": str(e), "user": "unknown", "free_reads_remaining": -1}
 
 
+def _fetch_lesson_by_id(lesson_id: str) -> dict:
+    """Fetch a lesson by its ID (filename without .md) across all lesson dirs."""
+    search_dirs = ["core", "contrib", "draft", "en"]
+    for subdir in search_dirs:
+        candidate = REPO_ROOT / "lessons" / subdir / f"{lesson_id}.md"
+        if candidate.exists():
+            raw = candidate.read_text(encoding="utf-8", errors="replace")
+            word_count = len(raw.split())
+            title = lesson_id
+            domain = subdir
+            tags_list = []
+            if raw.startswith("---"):
+                parts = raw.split("---", 2)
+                if len(parts) >= 3:
+                    fm = parts[1]
+                    for line in fm.split("\n"):
+                        if line.startswith("title:"):
+                            title = line.split(":", 1)[1].strip().strip('"\'')
+                        if line.startswith("domain:"):
+                            domain = line.split(":", 1)[1].strip()
+                        if line.startswith("tags:"):
+                            tags_val = line.split(":", 1)[1].strip()
+                            if tags_val.startswith("[") and tags_val.endswith("]"):
+                                import ast
+                                try:
+                                    tags_list = ast.literal_eval(tags_val)
+                                except Exception:
+                                    tags_list = [t.strip() for t in tags_val.strip("[]").split(",")]
+            return {
+                "id": lesson_id,
+                "path": str(candidate.relative_to(REPO_ROOT)),
+                "title": title,
+                "domain": domain,
+                "tags": tags_list,
+                "word_count": word_count,
+                "content": raw[:5000],
+                "category": subdir,
+            }
+    return {"error": f"Lesson not found: {lesson_id}"}
+
+
+def _list_domains() -> dict:
+    """List all knowledge domains with lesson counts."""
+    from collections import Counter
+    domain_counts = Counter()
+    search_dirs = ["core", "contrib", "draft", "en"]
+    for subdir in search_dirs:
+        d = REPO_ROOT / "lessons" / subdir
+        if d.exists():
+            for f in sorted(d.glob("*.md")):
+                raw = f.read_text(encoding="utf-8", errors="replace")
+                domain = subdir
+                if raw.startswith("---"):
+                    parts = raw.split("---", 2)
+                    if len(parts) >= 3:
+                        for line in parts[1].split("\n"):
+                            if line.startswith("domain:"):
+                                domain = line.split(":", 1)[1].strip()
+                                break
+                domain_counts[domain] += 1
+    return {
+        "domains": [{"domain": d, "count": c} for d, c in sorted(domain_counts.items())],
+        "total_lessons": sum(domain_counts.values()),
+    }
+
 # ── MCP Resources ──
 RESOURCES = [
     {
@@ -266,6 +340,18 @@ RESOURCES = [
         "name": "Changelog",
         "description": "Latest release notes and version history",
         "mimeType": "text/markdown",
+    },
+    {
+        "uri": "misakanet://lessons/{id}",
+        "name": "Lesson by ID",
+        "description": "Fetch a single lesson by ID with full content, title, domain, and word count",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "misakanet://domains",
+        "name": "Domain List",
+        "description": "List all knowledge domains with lesson counts across the repository",
+        "mimeType": "application/json",
     },
 ]
 
@@ -313,6 +399,13 @@ def handle_resources_read(uri: str) -> dict:
         if p.exists():
             return {"content": p.read_text(encoding="utf-8", errors="replace")[:4000]}
         return {"error": "STATUS.md not found"}
+
+    elif uri.startswith("misakanet://lessons/"):
+        lesson_id = uri.replace("misakanet://lessons/", "")
+        return _fetch_lesson_by_id(lesson_id)
+
+    elif uri == "misakanet://domains":
+        return _list_domains()
 
     return {"error": f"Unknown resource: {uri}"}
 
@@ -441,6 +534,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "Required redacted error message, keyword, or topic (for example: 'pip install timeout' or 'DCO sign-off failed')."},
                 "domain": {"type": "string", "description": "Optional domain filter such as devops, python, network, feishu, rag, fanuc, or mcp."},
                 "top": {"type": "integer", "description": "Maximum ranked results to return. Defaults to 5; keep small for MCP context and latency."},
+                "tags": {"type": "string", "description": "Optional comma-separated tags to filter results. Lessons must match at least one tag."},
             },
             "required": ["query"],
         },
